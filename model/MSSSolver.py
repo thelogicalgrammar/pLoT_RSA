@@ -1,4 +1,5 @@
 from z3 import *
+from copy import deepcopy
 
 # Generating maximal consistent subsets with z3
 # From: https://github.com/Z3Prover/blob/master/examples/python/mus/mss.py (but slightly modified to reset the solver state on each run of the function)
@@ -14,11 +15,14 @@ def enumerate_sets(solver):
 
 def all_smt(s, initial_terms):
     """
-    s: a solver (with maybe some constraints
+    s: a solver (with maybe some constraints)
     t: a list of terms
     
     From: https://stackoverflow.com/questions/11867611/y-checking-all-solutions-for-equation/70656700#70656700
     """
+
+    s = deepcopy(s)
+
     def block_term(s, m, t):
         s.add(t != m.eval(t, model_completion=True))
     def fix_term(s, m, t):
@@ -38,8 +42,8 @@ def all_smt(s, initial_terms):
 
 
 class MSSSolver:
-    def __init__(self, hard, soft):
-        self.s = Solver()
+    def __init__(self, hard, soft, solver):
+        self.s = solver
         self.varcache = {}
         self.idcache = {}
         self.n = len(soft)

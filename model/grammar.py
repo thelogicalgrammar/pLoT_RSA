@@ -1,0 +1,589 @@
+import z3
+
+from LOTlib3.Grammar import Grammar
+from LOTlib3.Eval import primitive
+from LOTlib3.Hypotheses.LOTHypothesis import LOTHypothesis
+from LOTlib3.Miscellaneous import attrmem, Infinity
+
+from math import log
+import numpy as np
+import builtins
+from copy import copy, deepcopy
+from itertools import product
+from functools import reduce
+
+from MSSSolver import MSSSolver, enumerate_sets, all_smt
+from Models import BooleanModel, ObjectsModel, colors
+
+symmetric_ops = [
+    'land_', 'lor_'
+]
+    
+
+def define_grammar(n_props, EXH=False, index=None):
+    """
+    __NOTE__: All function rules must have .name attribute 
+    that can be evaled into the corresponding function/object!
+    This is needed because when interpreting the function 
+    I need to evaluate the argument by itself.
+
+    Arguments
+    ---------
+    n_props: int
+        Number of propositions to consider
+    EXH: bool
+        Whether to include EXH in the grammar
+    index: None | int
+        Whether to include an index for the true utterance
+        (among the ones compatible with the phonological form)
+        in the grammar and if so, how many indices to include.
+        This depends on the utterance itself!
+        This appears as the first element in the listener's hypothesis
+        about what the speaker said.
+    """
+    
+    grammar = Grammar()
+
+    # This effectively functions as a check for whether we are using the grammar to define beliefs or utterances
+    if type(index) == int:
+        grammar.add_rule('START', 'tuple_', ['UTTINDEX', 'BOOL'], 1.0)
+        for i in range(index):
+            grammar.add_rule('UTTINDEX', f'u{i}', None, 1.0)
+            builtins.__dict__[f'u{i}'] = i
+        # We need notp because when encoding beliefs, we don't want
+        # knowledge of false propositions to be less likely
+        grammar.add_rule('BOOL', 'notp', ['INDEX', 'MODEL'], 5.0)
+    else:
+        # NOTE: Keep this as empty string name, because that's how 
+        # it's recognized in the _exhaustify function
+        grammar.add_rule('START', '', ['BOOL'], 1.0)
+    
+    grammar.add_rule('BOOL', 'land', ['BOOL', 'BOOL'], 1.0)
+    grammar.add_rule('BOOL', 'lor', ['BOOL', 'BOOL'], 1.0)
+    # Can't add 'eitheror' because it competes directly with 'or'!
+    # which means 'EXH(p or q)' == 'p or q'
+    # (different from natural language!)
+    # grammar.add_rule('BOOL', 'leitheror', ['BOOL', 'BOOL'], 1.0)
+    grammar.add_rule('BOOL', 'ifthen', ['BOOL', 'BOOL'], 1.0)
+    grammar.add_rule('BOOL', 'lnot', ['BOOL'], 2.0)
+    
+    grammar.add_rule('BOOL', 'p', ['INDEX', 'MODEL'], 5.0)
+
+    for i in range(n_props):
+        grammar.add_rule('INDEX', f'i{i}', None, 1.0)
+        builtins.__dict__[f'i{i}'] = i
+
+    grammar.add_rule('MODEL', 'M', None, 1.0)
+    
+    # --> is_color_(OBJECT, 'red') --> OBJECT.color == 'red'
+    # grammar.add_rule('BOOL', 'is_color',  ['OBJECT', 'COLOR'], 5.00)
+    
+    # for c in colors:
+    #     grammar.add_rule('COLOR', c.sexpr(), None, 1.0)
+    
+    # for i in range(n_objects):
+    #     grammar.add_rule('OBJECT', f'W[{i}]', None, 1.0)
+
+    if EXH:
+        # add EXH for bool
+        # NOTE: this must be at the end!
+        grammar.add_rule('BOOL', 'EXH', ['BOOL'], 2.0)
+
+    ##### DEFINE MEANINGS
+
+    # make colors available to LOTlib3
+    for c in colors:
+        builtins.__dict__[c.sexpr()] = c
+
+    @primitive
+    def tuple_(index, model):
+        return (index, model)
+
+    @primitive
+    def p(index, model):
+        return model(index)
+
+    @primitive
+    def notp(index, model):
+        return z3.Not(model(index))
+
+    @primitive
+    def land(p, q):
+        return z3.And(p, q)
+
+    @primitive
+    def lor(p, q):
+        return z3.Or(p, q)
+
+    @primitive
+    def leitheror(p, q):
+        return z3.Or(z3.And(z3.Not(p), q), z3.And(p, z3.Not(q)))
+
+    @primitive
+    def lnot(p):
+        return z3.Not(p)
+
+    @primitive
+    def ifthen(p, q):
+        return z3.Implies(p, q)
+
+    @primitive
+    def is_color(obj, col):
+        return obj.color == col
+
+    @primitive
+    def EXH(h):
+        """
+        Returns the exhaustified meaning.
+        
+        This is a bit tricky.
+        The reason using EXH is complicated is that
+        when using python's "eval" is not aware of the syntax
+        and so cannot find structural alternatives.
+
+        h: z3 formula
+        """
+        return h
+
+    return grammar
+
+
+class Exhaustifier:
+
+    def __init__(self, grammar, qud, solver, cache_fs=False):
+        """
+        Following Katzir, we define the structural alternatives of a sentence as the sentences that can be produced by 
+            1. Deletion
+            2. Contraction
+            3. Replacement
+        of its nodes with other nodes from the substitution source (which we assume here for simplicity is the lexicon).
+
+        NOTE: This is a superclass of Utterance, so has access to self.QUD
+        """
+
+        self.solver = solver
+        self.grammar = grammar
+        self.qud = qud
+
+        # Do this so that instances can get garbage collected
+        # see: https://rednafi.com/python/lru_cache_on_methods/
+        # but NOTE: Caching gives wrong results atm!
+        self.innocently_excludable = (
+            cache(self._innocently_excludable)
+            if cache_fs
+            else self._innocently_excludable
+        )
+        self.exhaustify = (
+            cache(self._exhaustify)
+            if cache_fs
+            else self._exhaustify
+        )
+        self.find_structural_alternatives = (
+            cache(self._find_structural_alternatives)
+            if cache_fs
+            else self._find_structural_alternatives
+        )
+
+    def _innocently_excludable(self, x, negalts):
+
+        solver = MSSSolver(
+            x,
+            negalts,
+            # this is not very clean, but we don't want MSSSolver
+            # to change the state of the solver
+            deepcopy(self.solver)
+        )
+        mms = tuple(enumerate_sets(solver))
+        intersection = reduce(lambda x, y: x & set(y), mms, set(mms[0]))
+        # interpret as z3 expressions rather than boolean literals
+        returnvalue = [
+            solver.vars_dict[i] 
+            for i in intersection
+        ]
+        return returnvalue
+
+    def _exhaustify(self, x, M):
+        """
+        Computes the exhaustified addition to utterance x recursively.
+        x is a LOTlib3 FunctionNode that potentially contains EXHs.
+        
+        1. If the node is an EXH:
+            1. runs self.find_structural_alternatives on its arg
+            2. selects the alts ALTS whose negation does not contradict p and is not entailed by p
+            3. find the innocently excludable subset
+            4. return a conjunction of their negations, which is the exhaustified meaning
+        2. If the node is not EXH:
+            1. Run self._exhaustify on each argument, pass up resulting meaning
+                (to replace its literal meaning with its (potentially) exhaustified meaning, 
+                    if it contains an EXH)
+
+        Arguments
+        ---------
+        x: LOTlib3.FunctionNode
+            The node we are exhaustifying
+
+        Returns
+        -------
+        z3 formula
+            The interpretation of the utterance
+        """
+        
+        if x.name == 'EXH':
+            # EXH has a single argument
+            subnode = list(x.argFunctionNodes())[0]
+            # get interpretation of the subnode
+            x_int = self._exhaustify(subnode, M)
+            # find the recursively defined structural alternatives
+            # and add the negation of each to conjs
+            conjs = []
+            for y in self.find_structural_alternatives(subnode):
+                content = self._exhaustify(y,M)
+                interpretation = z3.Not(content)
+                self.solver.push()
+                self.solver.add(interpretation)
+                satisfiable = self.solver.check() == z3.sat
+                self.solver.pop()
+                # check if the alternative is relevant to the QUD
+                # Only consider relevant alternatives
+                relevant = self.qud.is_relevant(
+                    interpretation,
+                    self.solver
+                )
+                if relevant and satisfiable:
+                    # NOTE: Do NOT simplify; the internal structure
+                    # is important!
+                    conjs.append(interpretation)
+            # find innocently excludable subset of those alts
+            inn_exh = list(self.innocently_excludable(
+                x_int, 
+                tuple(conjs)
+            ))
+            returnvalue = z3.And([x_int] + inn_exh)
+            return returnvalue
+        else:
+            # get the potentially enriched meaning for each 
+            # argument of the expression, i.e.,
+            # modify the arguments of the current top node
+            # so that they have their exhaustified content.
+            # E.g. not(exh(p)) --> not(p and not q)
+            if x.is_nonfunction():
+                return eval(str(x))
+
+            # get exhaustified content for each argument
+            exh_content = [
+                self._exhaustify(y, M)
+                for y 
+                in x.argFunctionNodes()
+            ]
+
+            if x.name == '':
+                # this is the top node, which does not do anything
+                # so just run identity function
+                node_int = lambda x: x
+            elif x.name == 'M':
+                # This is the model which is special because it is
+                # a variable passed to the hypothesis 
+                return M
+            else:
+                # run top argument with exhaustified content
+                # first get object
+                node_int = eval(x.name)
+            
+            enriched_int = node_int(*exh_content)
+            return enriched_int
+
+    def _find_structural_alternatives(self, x):
+        """
+        Defined recursively for a LOTlib3 FunctionNode x!
+        Takes a node and returns the structural alternatives to that node
+        """
+        nargs = x.nargs()
+        xtype = x.get_rule_signature()[0]
+
+        if x.name == 'EXH':
+            yield from self.find_structural_alternatives(
+                # EXH has a single argument!
+                list(x.argFunctionNodes())[0]
+            )
+            # don't keep going!
+            return
+    
+        if nargs == -1:
+            # if x is a leaf, you return
+            # each of the lexical alternatives of the same type
+            for alt_r in self.grammar.get_rules(x.type()):
+                alt = alt_r.make_FunctionNodeStub(self.grammar, None)
+                if not alt.is_function():
+                    yield alt
+        
+        else:
+            
+            # return the alts of each child, if of the same type as parent
+            # This corresponds to Katzir's deletion and contraction
+            # E.g., "p and q" -> "p"
+            # E.g., "not p"   -> "p"
+            for arg in x.args:
+                if arg.get_rule_signature()[0] == xtype:
+                    for i in self.find_structural_alternatives(arg):
+                        yield copy(i)        
+        
+            # if x has one or more arguments,
+            # return the alternatives obtained by
+            # the product of each child's alts
+            # & the node's own alts
+    
+            # loop through all combos of alternatives of arguments
+            # (parents are none here for the arguments but are set below)
+            args_alts_gens = [
+                list(self.find_structural_alternatives(y))
+                for y in x.args
+            ]
+            
+            # Consider all possible alternative rules for self
+            for r in self.grammar.get_rules(xtype):
+                # make sure argument types match
+                if r.to == x.argTypes():
+                    for args in product(*args_alts_gens):
+                        self_alt = r.make_FunctionNodeStub(self.grammar, None)
+                        if self_alt.is_canonical_order(symmetric_ops) and self_alt.name!='EXH':
+                            # copy because product reuses the objects
+                            self_alt.args = [copy(a) for a in args]
+                            for arg in self_alt.argFunctionNodes():
+                                arg.parent = self_alt
+                            yield self_alt 
+
+
+class MeaningHypothesis(LOTHypothesis):
+
+    def __init__(self, utts, qud, solver, temp, model,
+                 grammar, print_log=False, **kwargs):
+        """
+        These encode underlying meanings
+
+        Parameters
+        ----------
+        qud: QUD
+            The question under discussion
+        solver: z3 solver
+            A solver that may encode some known facts about the world
+        grammar: lotlib3 grammar
+            Without EXH: this encodes a belief state, not an utterance!
+            With index: this tracks the index of the utterance 
+            among the ones compatible with the phonform!
+        """
+
+        LOTHypothesis.__init__(
+            self,
+            grammar=grammar,
+            display='lambda M: %s',
+            **kwargs
+        )
+
+        # All the possible meanings of the phonological form
+        # These are the "possible utterances" in the RSA sense
+        self.utts = utts
+
+        self.print_log = print_log
+        self.solver = solver
+        self.qud = qud
+        self.temp = temp
+        self.model = model
+
+        self.define_p_given_utt()
+
+    def define_p_given_utt(self):
+        """
+        Find the distribution over the answers to the QUD for an L0
+        given the utterance
+        """
+        p_given_utts = []
+        for u in self.utts:
+            p_given_utt = []
+            for prop in self.qud:
+                self.solver.push()
+                self.solver.add(z3.And(u, prop))
+                p_given_utt.append(self.solver.check() == z3.sat)
+                self.solver.pop()
+
+            p_given_utts.append([
+                x/sum(p_given_utt) 
+                for x in p_given_utt
+            ])
+        self.p_given_utts = p_given_utts
+
+
+    def compute_single_likelihood(self, datum):
+        """
+        Compute the likelihood P( phon form | speaker's belief state )
+        by marginalizing across the possible meanings of the phon form.
+        """
+
+        # get speaker's meaning as a z3 formula
+        i, f = self(self.model)
+
+        # utils = []
+        # for u in utts:
+        u = self.utts[i]
+
+        # we assume that the utterance is not stronger 
+        # than the belief state.
+        # i.e., BELIEF STATE \in UTTERANCE
+        # i.e., the speaker does not say more than they believe
+        # so start by checking that the belief state entails the utterance
+        self.solver.push()
+        self.solver.add(z3.Not(z3.Implies(f, u)))
+        implies = self.solver.check() == z3.unsat
+        self.solver.pop()
+
+        # We also assume the belief is consistent, so check *that*
+        self.solver.push()
+        self.solver.add(f)
+        consistent = self.solver.check() == z3.sat
+        self.solver.pop()
+
+        if consistent and implies:
+
+            # Belief is consistent and entails utterance, so
+            # it's a possible candidate!
+            # Find probability of utterance u given belief state f
+
+            # First find the answers to the QUD that are
+            # compatible with the observation
+            p_given_obs = []
+            for prop in self.qud:
+                self.solver.push()
+                self.solver.add(z3.And(f, prop))
+                p_given_obs.append(self.solver.check() == z3.sat)
+                self.solver.pop()
+
+            # normalize to get the (approximate) probability of each answer
+            # given the belief state.
+            # Since each element of p_given_obs is a boolean, all probs
+            # are going to be either 0 or 1/sum(p_given_obs).
+            p_given_obs = [
+                x/sum(p_given_obs) 
+                for x in p_given_obs
+            ]
+
+            # compute the (negative) KL divergence 
+            # from p_given_utt to p_given_obs
+            util = sum([
+                -x*(np.log(x) - np.log(y)) 
+                if (x != 0 and y != 0) else 0
+                for x,y in zip(p_given_obs, self.p_given_utts[i])
+            ])
+
+        else:
+            util = -Infinity
+
+        # utils.append(util/len(utts))
+                
+        # OLD: Compute probability of each utterance given the KL divergence
+        # as a softmax of the (negative) KL divergences
+        # probs_production = softmax(utils, self.temp)
+        # NEW: Just consider the unnormalized KL divergence
+        prob = np.exp(np.array(util) * self.temp)
+
+        if self.print_log:
+            print()
+            print('----------')
+            print('hyp: ', self.__str__())
+            print('qud: ', self.qud)
+            print('util:', util)
+            print('exp KL: ', prob)
+        
+        # compute expected KL divergence across utterances
+        if np.isnan(prob) or prob==0:
+            if self.print_log:
+                print('inconsistent prob: ', prob)
+                print()
+            # if the speaker said something incoherent
+            return log(1-datum.alpha)
+
+        prob_belief = self.qud.QUD_prior(f)
+
+        if self.print_log:
+            print('prob belief: ', prob_belief)
+            print('total lik: ', prob*prob_belief)
+
+        return log(prob) + log(prob_belief)
+
+    def __copy__(self, value=None):
+        """
+        Copied from LOTlib3 Hypothesis
+        Returns a copy of the Hypothesis. Allows you to pass in value to set to that instead of a copy.
+        """
+
+        thecopy = type(self)(
+            utts=self.utts,
+            qud=self.qud,
+            solver=self.solver,
+            temp=self.temp,
+            model=self.model,
+            grammar=self.grammar,
+        ) 
+
+        # copy over all the relevant attributes and things.
+        # Note objects like Grammar are not copied
+        thecopy.__dict__.update(self.__dict__)
+
+        # and then we need to explicitly *deepcopy* the value (in case its a dict or tree, or whatever)
+        if value is None:
+            value = deepcopy(self.value)
+
+        thecopy.set_value(value)
+
+        return thecopy
+
+
+class Utterance(LOTHypothesis, Exhaustifier):
+    
+    def __init__(self, qud, model, grammar, solver, value=None, **kwargs):
+        """
+        An utterance is the underlying representation of a phonological form
+        including the silent morpheme EXH (and potentially more!).
+        This is what the semantics sees.
+
+        Arguments
+        ---------
+        qud: QUD
+            The qud is a way of restricting which alternatives are considered.
+        grammar: LOTlib3 grammar
+            Grammar with EXH (since this is an utterance and not just
+            a phonological form).
+        value: LOTlib3.FunctionNode.FunctionNode
+            The value of the utterance as a FunctionNode generated by the grammar.
+        """
+
+        LOTHypothesis.__init__(
+            self,
+            grammar=grammar,
+            display='lambda M: %s',
+            value=value,
+            **kwargs
+        )
+
+        self.model = model
+
+        # an exhaustifier to use in the likelihood calculation
+        Exhaustifier.__init__(
+            self,
+            grammar=grammar,
+            qud=qud,
+            solver=solver
+        )
+
+    def __call__(self):
+        """
+        overwrite the exhaustify method from Exhaustifier so that it uses
+        the value of the utterance as the input.
+        """
+        return self.exhaustify(self.value, self.model)
+
+    def compute_single_likelihood(self, datum):
+        """
+        This doesn't need to be defined since we are not using these
+        for inference.
+        """
+        pass
+
