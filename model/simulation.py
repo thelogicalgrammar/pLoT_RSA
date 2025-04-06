@@ -16,7 +16,7 @@ def infer_meaning(qud, model, solver, grammar_belief, possible_meanings,
         grammar_belief = define_grammar(
             n_props,
             False,
-            len(utterances_values)
+            len(parses_values)
         )
 
 
@@ -29,11 +29,11 @@ def infer_meaning(qud, model, solver, grammar_belief, possible_meanings,
     n_steps: int
     temp: float>0
     alpha: float[0,1]
-        Probability of a speaker getting the utterance right
+        Probability of a speaker getting the parse right
     """
 
     h0 = MeaningHypothesis(
-        utts=possible_meanings,
+        parses=possible_meanings,
         qud=qud, 
         solver=solver,
         temp=temp,
@@ -51,7 +51,7 @@ def infer_meaning(qud, model, solver, grammar_belief, possible_meanings,
         alpha=alpha,
     )]
 
-    # get an approximated posterior over interpretations given the utterance
+    # get an approximated posterior over interpretations given the parse
     single_tn = TopN()
 
     with tqdm(total=n_steps) as pbar:

@@ -1,75 +1,102 @@
 from math import factorial as fac
-
 import z3
 
 class QUD:
     
-    def __init__(self, props, solver):
+    def __init__(self, partition_f, solver, minimum=None, maximum=None):
         """
         This class encodes a Question Under Discussion (QUD).
-
-        Keep track of partition on the model set,
-        each element being a possible answers to the question.
+        The partition_f function is a z3 function
+        that maps things in a Model into a partition cell
+        represented as an integer.
+        This gives us a general way of encoding partitions.
         See: https://centaur.reading.ac.uk/80434/2/Questions%20under%20discussion_final.pdf
 
         Arguments
         ---------
-        props: list[z3 formula]
-            Propositions that ought to be settled for the QUD;
-            they partition the possible worlds.
+        partition: z3 formula
+            Encodes a proposition that ought to be settled for the QUD;
+            It partitions the possible worlds.
         """
-        self.props = props
+        self.partition_f = partition_f
         self.solver = solver
-        # check if the partition is valid
-        assert self.check_partition(), "The partition is not valid!"
-
-    def check_partition(self):
-        """
-        Check that the set of propositions self.prop is a
-        partition of the model space.
-        """
-        # Check mutual exclusivity
-        mutual_exclusivity = True
-        for i in range(len(self.props)):
-            for j in range(i + 1, len(self.props)):
-                self.solver.push()
-                self.solver.add(z3.And(self.props[i], self.props[j]))
-                if self.solver.check() == z3.sat:
-                    mutual_exclusivity = False
-                    self.solver.pop()
-                    break
-                self.solver.pop()
-            if not mutual_exclusivity:
-                break
-
-        # Check collective exhaustiveness
-        self.solver.push()
-        self.solver.add(z3.Not(z3.Or(self.props)))
-        collective_exhaustiveness = (self.solver.check() == z3.unsat)
-        self.solver.pop()
-
-        # Output results
-        if mutual_exclusivity and collective_exhaustiveness:
-            return True
+        
+        if minimum is None:
+            self.min = self.find_min()
         else:
-            if not mutual_exclusivity:
-                print("The set of self.props is not mutually exclusive.")
-            if not collective_exhaustiveness:
-                print("The set of self.props is not collectively exhaustive.")
+            self.min = minimum
+        if maximum is None:
+            self.max = self.find_max()
+        else:
+            self.max = maximum
+
+        self.alternatives = self.find_alternatives()
+
+    def find_min(self):
+        """
+        Uses the Optimize module to find the minimum value of partition_f
+        under the constraints in the solver.
+        """
+        opt = z3.Optimize()
+        # Add all constraints from the provided solver.
+        for a in self.solver.assertions():
+            opt.add(a)
+        h_min = opt.minimize(self.partition_f)
+        if opt.check() == z3.sat:
+            lb = h_min.value().as_long()
+            return lb
+        else:
+            raise Exception("Constraints are unsatisfiable when minimizing partition_f.")
+
+    def find_max(self):
+        """
+        Uses the Optimize module to find the maximum value of partition_f
+        under the constraints in the solver.
+        """
+        opt = z3.Optimize()
+        for a in self.solver.assertions():
+            opt.add(a)
+        h_max = opt.maximize(self.partition_f)
+        if opt.check() == z3.sat:
+            ub = h_max.value().as_long()
+            return ub
+        else:
+            raise Exception("Constraints are unsatisfiable when maximizing partition_f.")
+
+    def find_alternatives(self):
+        """
+        Loops over the range [min, max] and collects those values for which
+        there is a model. Each alternative is represented as the formula
+        (partition_f == n).
+        """
+        alternatives = []
+        # Iterate over the candidate partition cell values.
+        for n in range(self.min, self.max + 1):
+            s = z3.Solver()
+            # Add all constraints from the original solver.
+            for a in self.solver.assertions():
+                s.add(a)
+            s.add(self.partition_f == n)
+            if s.check() == z3.sat:
+                # Record the formula corresponding to this cell.
+                alternatives.append(self.partition_f == n)
+        return alternatives
 
     def is_relevant(self, answer, solver):
         """
-        Evaluates if the answer is relevant to the QUD. An answer is relevant if it:
-            - Entails the negation of at least one alternative (partial answer).
-            - Its negation is a partial answer.
+        Evaluates if the answer is relevant to the QUD. 
+        An answer is relevant if it or its negation 
+        entails the negation of at least one alternative (partial answer).
         Note that "resolving answers" are also partial answers.
 
         Arguments
         ---------
-        meaning: z3 formula 
-            The meaning to evaluate the QUD on
+        answer: z3 formula 
+            The answer to evaluate the QUD on
         """
-        for prop in self.props:
+        
+        # loop over the cells of the partition
+        for prop in self.alternatives:
             h1 = self.implies(prop, answer, solver)
             h2 = self.implies(prop, z3.Not(answer), solver)
             if h1 in ['implies', 'impliesnot']:
@@ -99,6 +126,7 @@ class QUD:
                 if solver.check() == z3.unsat 
                 else 'norelation'
             )
+        
         solver.pop()
         return outcome
 
@@ -110,10 +138,10 @@ class QUD:
         raise NotImplementedError
 
     def __iter__(self):
-        return iter(self.props)
+        return iter(self.alternatives)
 
     def __len__(self):
-        return len(self.props)
+        return len(self.alternatives)
 
 
 def binomial(x, y):
@@ -142,92 +170,100 @@ def zero_truncated_binomial(n, p):
 
 
 class ProductQUD(QUD):
-
-    def __init__(self, *atoms, solver, prob_knows=None):
+    
+    def __init__(self, *atoms, solver, prob_knows=0.5, p_truth=0.5):
         """
         Create a QUD from a product of atomic propositions.
-        Each element is a proposition. This function builds
-        a partition from the product of the propositions.
-        Any two elements in the product are mutually exclusive.
-        and collectively exhaustive.
-        NOTE: Their negations also need to be explicitly included.
-        NOTE: This does not scale well for large numbers of atoms.
-
-        Create a partition from the product of the propositions
-        e.g. for [p1,p2] -> [
-            z3.And(p1, p2), 
-            z3.And(z3.Not(p1), p2),
-            z3.And(p1, z3.Not(p2)),
-            z3.And(z3.Not(p1), z3.Not(p2))
-        ]
-
+        Each element is an atomic proposition. The partition is built
+        by encoding the truth values of the atoms as bits in an integer.
+        For example, given [p1, p2] the partition function is:
+        
+            partition_f = If(p1, 1, 0) + If(p2, 2, 0)
+        
+        which yields values 0, 1, 2, or 3 corresponding to:
+        
+            [Not(p1) & Not(p2), p1 & Not(p2), Not(p1) & p2, p1 & p2]
+        
         Arguments
         ---------
-        prob_knows: float
-            A probability, gives the probability of the speaker knowing
-            whether each proposition is true (independently of the others)
+        atoms: Z3 BoolRef
+            A sequence of atomic propositions.
+        solver: z3.Solver
+            A solver instance that already contains any additional constraints.
+        prob_knows: float, optional
+            The probability that the speaker knows whether each proposition is true.
         """
-
-        # Create all possibilities
-        n = len(atoms)
-        props = []
-        for i in range(2 ** n):
-            combination = []
-            for j in range(n):
-                if (i >> j) & 1:
-                    combination.append(atoms[j])
-                else:
-                    combination.append(z3.Not(atoms[j]))
-            props.append(z3.And(combination))
-
         self.atoms = atoms
+        self.p_truth = p_truth
         self.prob_knows = prob_knows
-        QUD.__init__(self, props, solver)
+        # Create the partition function by treating each atom as a bit.
+        partition_expr = z3.Sum([z3.If(atom, 2**j, 0) for j, atom in enumerate(atoms)])
+        # Call the parent constructor with the partition expression.
+        super().__init__(partition_expr, solver)
 
-    def QUD_prior(self, prop, strategy='binomial'):
+    def QUD_prior(self, prop, strategy='partitions'):
         """
-        Calculate the probability of a belief state based on 
-        one of the strategies.
-        """
+        Strategy refers to whether the prob_knows is one of knowing 
+        whether atoms are true or false ('atoms')
+        or whether partition alternatives are true or false ('partitions').
 
-        if strategy == 'factorized':
-            # the probability of knowing whether each proposition 
-            # in the QUD is T/F. 
-            # For each atom, check whether the proposition entails it
-            # or its negation and if so, multiply the probability 
-            # of knowing whether the atom is true, 
-            # else by the probability of not knowing it
-            prob = 1
-            for i, atom in enumerate(self.atoms):
+        The intuitive difference is that 'atoms' is less fine-grained,
+        because it only captures whether the speaker's belief
+        determines whole atomic propositions, rather than 
+        combinations of their truth values.
+
+        E.g., (1) 'p and not q' and (2) '(p and not q) and not(p and q)
+        'atoms' find them equivalent, but for 'partitions' 
+        the speaker knows more in (2).
+        
+        Parameters
+        ----------
+        prop : Z3 formula
+            The belief state (a proposition) to evaluate.
+        
+        Returns
+        -------
+        float
+            The computed probability of the belief state.
+        """
+        
+        if strategy=='atoms':
+            # Calculate the total probability of a belief state (prop) according to
+            # the following factors:
+            #   - For each atomic proposition that the belief state "knows" (i.e., entails
+            #     either the atom or its negation), multiply by p_knowing * p_truth.
+            #   - For each atom that the belief state does not resolve, multiply by (1 - p_knowing).
+            # This product represents:
+            # P(knowing the atoms) * P(known atoms having the known truth values)
+            prob = 1.0
+            for atom in self.atoms:
+                # Check whether the belief state determines the truth of the atom.
                 if self.knows_whether(prop, atom):
-                    prob *= self.prob_knows
+                    prob *= (self.prob_knows * self.p_truth)
                 else:
                     prob *= (1 - self.prob_knows)
-
-        elif strategy == 'binomial':
-            # find the number of atoms that are entailed by the proposition
-            n_true = 0
-            for i, p in enumerate(self.props):
-                if self.knows_whether(prop, p):
-                    n_true += 1
-                else:
-                    pass
-            prob = zero_truncated_binomial(
-                len(self.props),
-                self.prob_knows
-            )[n_true-1]
-
-        else:
-            raise ValueError("Invalid kind of prior!")
-
+        
+        elif strategy=='partitions':
+            # Compute the total probability of a belief state (prop) according to:
+            # P(belief) = (p_knowing * p_truth)^(# resolved alternatives)
+            #             * (1 - p_knowing)^(# unresolved alternatives)
+            # Here, an alternative (a partition cell in self.props) is "resolved" by prop if
+            # either prop entails that cell or prop entails its negation.
+            # This prior therefore distinguishes between belief states that rule out more of the partition.
+            n = len(self.alternatives)
+            resolved = 0
+            for alt in self.alternatives:
+                if self.knows_whether(prop, alt):
+                    resolved += 1
+            unresolved = n - resolved
+            prob = (self.prob_knows * self.p_truth) ** resolved * (1 - self.prob_knows) ** unresolved
+        
         return prob
 
     def knows_whether(self, prop, atom):
         """
-        Check if the prop (representing a belief state here)
-        determines whether the atom is true or false.
+        Check if the belief state (prop) determines whether the atom is true or false.
         """
-
         self.solver.push()
         self.solver.add(z3.Not(z3.Implies(prop, atom)))
         ent = self.solver.check() == z3.unsat

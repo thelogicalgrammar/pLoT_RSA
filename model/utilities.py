@@ -5,7 +5,7 @@ from copy import copy, deepcopy
 from hurford import hurford_constraint
 from MSSSolver import MSSSolver, enumerate_sets, all_smt
 from Models import BooleanModel, ObjectsModel, colors
-from grammar import Utterance
+from grammar import Parse
 
 
 def softmax(x, temp=1):
@@ -87,7 +87,6 @@ def remove_duplicates(formulas, solver, return_indices=False):
     if return_indices:
         indices = []
     for i, formula in enumerate(formulas):
-        # Simplify the formula to a canonical form
         # NOTE: Do NOT simplify; the internal structure
         # is potentially important for recognizing hurford constraint!
         is_unique = True
@@ -121,14 +120,14 @@ def produce_possible_structures(phonform, grammar):
     ---------
     phonform: LOTlib3.FunctionNode.FunctionNode
         a phonological form 
-        i.e., utterance without the silent morpheme EXH
+        i.e., parse without the silent morpheme EXH
     grammar: LOTlib3 grammar
         for global call, the grammar for the phonological form 
         (with or without EXH)
     Return
     ------
     list[LOTlib3.FunctionNode.FunctionNode]
-        A list of possible utterances
+        A list of possible parses
         i.e. ways of inserting EXH
     """
 
@@ -182,40 +181,42 @@ def produce_possible_structures(phonform, grammar):
 def find_phonform_possible_structures(phonform, grammar, qud, model, solver,
                                       unique=True):
     """
-    Grammar is the utterance grammar
+    Grammar is the parse grammar
 
-    Generate the possible utterances by placing a single EXH
+    Generate the possible parse by placing a single EXH
     everywhere it can be placed.
-    Utteraces are instances of the Utterance class
+    Parses are instances of the Parse class
     """
 
-    utterances_values = produce_possible_structures(
+    parses_values = produce_possible_structures(
         phonform, 
         grammar
     )
 
-    possible_utterances = [
-        Utterance(
+    possible_parses = [
+        Parse(
             qud=qud, 
             model=model,
             grammar=grammar,
             solver=solver,
             value=value,
         )
-        for value in utterances_values
+        for value in parses_values
     ]
 
     possible_meanings = [
         x() 
-        for x in possible_utterances
+        for x in possible_parses
     ]
 
     ### HURFORD CONSTRAINT ###
     results = []
-    for m, uv in zip(possible_meanings, utterances_values):
+    for m, uv in zip(possible_meanings, parses_values):
         if hurford_constraint(m, solver):
             results.append((m, uv))
-    possible_meanings, utterances_values = zip(*results)
+        else:
+            print(f"{uv} has been excluded because failed hurford!")
+    possible_meanings, parses_values = zip(*results)
 
     if unique:
         indices_unique, possible_meanings = remove_duplicates(
@@ -223,17 +224,18 @@ def find_phonform_possible_structures(phonform, grammar, qud, model, solver,
             solver,
             return_indices=True
         )
-        utterances_values = [utterances_values[i] for i in indices_unique]
+        parses_values = [parses_values[i] for i in indices_unique]
 
-    return possible_meanings, utterances_values
+    return possible_meanings, parses_values
 
 
-def print_possible_utterances(utterances_values, possible_meanings, 
+def print_possible_parses(parses_values, possible_meanings, 
                               n_props, solver):
+    
     boolean_model = BooleanModel(n_props)
     print('terms: ', boolean_model.terms, '\n')
-    for i in range(len(utterances_values)):
-        print(utterances_values[i])
+    for i in range(len(parses_values)):
+        print(parses_values[i])
         m = possible_meanings[i]
         if solver is not None and n_props is not None:
             solver.push()

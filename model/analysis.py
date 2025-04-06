@@ -1,6 +1,6 @@
 from model.utilities import (
     find_phonform_possible_structures,
-    print_possible_utterances
+    print_possible_parses
 )
 
 from model.grammar import MeaningHypothesis
@@ -24,13 +24,13 @@ def already_defined(dictionary, fullmeaning, posterior_score, solver):
     assert posterior_score >= 0, 'Posterior score in prob space, not logprob!'
     dictionary = deepcopy(dictionary)
     new = True
-    utt_index, meaning = fullmeaning
+    parse_index, meaning = fullmeaning
     for (i, m), p in dictionary.items():
         solver.push()
         solver.add(z3.Not(meaning == m))
-        if (solver.check() == z3.unsat) and (i == utt_index):
+        if (solver.check() == z3.unsat) and (i == parse_index):
             # equivalent
-            dictionary[(utt_index, m)] = p + posterior_score
+            dictionary[(parse_index, m)] = p + posterior_score
             # it's not going to be synonymous
             # with anything else, given how
             # dictionary is constructed
@@ -47,7 +47,7 @@ def already_defined(dictionary, fullmeaning, posterior_score, solver):
 def compress_meaning_dict(dictionary):
     """
     Take the output of already_defined and compress it by ignoring the 
-    utterance index, so that we get the marginal probability of meanings.
+    parse index, so that we get the marginal probability of meanings.
     """
     returnvalue = dict()
     # get unique meanings
@@ -102,7 +102,7 @@ def analyse_specific_hyps(s, hypotheses, n_props, grammar_phon, grammar_belief,
                           qud, temp, model, solver, print_log=True, **kwargs):
     """
     Prints information about the likelihood of specific hypotheses
-    i.e., (utterance indices, belief states)
+    i.e., (parse indices, belief states)
     given a specific sentence s
 
     Example of grammar definition: 
@@ -116,18 +116,16 @@ def analyse_specific_hyps(s, hypotheses, n_props, grammar_phon, grammar_belief,
     if isinstance(s, str):
         s = parse(s, grammar_phon)
     
-    possible_meanings, utterances_values = (
-        find_phonform_possible_structures(
-            phonform=s,
-            grammar=grammar_phon,
-            qud=qud,
-            model=model,
-            solver=solver
-        )
+    possible_meanings, parses_values = find_phonform_possible_structures(
+        phonform=s,
+        grammar=grammar_phon,
+        qud=qud,
+        model=model,
+        solver=solver
     )
     
-    print_possible_utterances(
-        utterances_values,
+    print_possible_parses(
+        parses_values,
         possible_meanings,
         n_props,
         solver
@@ -147,7 +145,7 @@ def analyse_specific_hyps(s, hypotheses, n_props, grammar_phon, grammar_belief,
             h = parse(h, grammar_belief)
 
         meaninghyp = MeaningHypothesis(
-            utts=possible_meanings,
+            parses=possible_meanings,
             solver=solver,
             grammar=grammar_belief,
             value=h,
@@ -164,7 +162,7 @@ def analyse_specific_hyps(s, hypotheses, n_props, grammar_phon, grammar_belief,
     return output
 
 
-def plot_results(dictionary, solver, dict_type='tn', first_n=None):
+def plot_results(dictionary, solver, dict_type='tn', first_n=None, ignore_parse=False):
     """
     Plot the output of analyse_specific_hyps
     """
@@ -203,9 +201,12 @@ def plot_results(dictionary, solver, dict_type='tn', first_n=None):
 
     pprint(meanings)
 
-    meanings = compress_meaning_dict(meanings)
+    if ignore_parse:
+        meanings = compress_meaning_dict(meanings)
 
-    expressions, unnorm_ps = zip(*list(meanings.items()))
+    keys, unnorm_ps = zip(*list(meanings.items()))
+    if not ignore_parse:
+        parses, expressions = zip(*keys)
     expressions = [z3.simplify(x) for x in expressions]
     unnorm_ps = np.array(unnorm_ps)
     unnorm_ps = unnorm_ps / unnorm_ps.sum()
@@ -219,10 +220,22 @@ def plot_results(dictionary, solver, dict_type='tn', first_n=None):
     ax.set_xticks(
         np.arange(len(unnorm_ps))
     )
+
+    xlabels = [
+        html.unescape(x._repr_html_())
+        for x in np.array(expressions)[order]
+    ]
+
+    if not ignore_parse:
+        xlabels = [
+            f"{parse}, {expr}"
+            for parse,expr
+            in zip(np.array(parses)[order],xlabels)
+        ]
+    
     ax.set_xticklabels(
-        [
-            html.unescape(x._repr_html_())
-            for x in np.array(expressions)[order]
-        ],
+        xlabels,
         rotation='vertical'
     )
+
+    return fig, ax
