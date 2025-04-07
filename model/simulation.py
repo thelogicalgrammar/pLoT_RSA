@@ -8,7 +8,7 @@ from tqdm import tqdm
 from grammar import MeaningHypothesis
 
 
-def infer_meaning(qud, model, solver, grammar_belief, possible_meanings,
+def infer_meaning(qud, model, solver, grammar_belief, grammar_EXH, utterance,
                   n_steps=10000, temp=5, prior_temperature=1, 
                   likelihood_temperature=1, alpha=1-1e-5, print_log=False):
     """
@@ -33,12 +33,13 @@ def infer_meaning(qud, model, solver, grammar_belief, possible_meanings,
     """
 
     h0 = MeaningHypothesis(
-        parses=possible_meanings,
+        utterance=utterance,
         qud=qud, 
         solver=solver,
         temp=temp,
         model=model,
         grammar=grammar_belief, 
+        grammar_EXH=grammar_EXH,
         prior_temperature=prior_temperature,
         likelihood_temperature=likelihood_temperature,
         print_log=print_log

@@ -4,6 +4,7 @@ from LOTlib3.Grammar import Grammar
 from LOTlib3.Eval import primitive
 from LOTlib3.Hypotheses.LOTHypothesis import LOTHypothesis
 from LOTlib3.Miscellaneous import attrmem, Infinity
+from hurford import hurford_constraint
 
 from math import log
 import numpy as np
@@ -15,12 +16,132 @@ from functools import reduce
 from MSSSolver import MSSSolver, enumerate_sets, all_smt
 from Models import BooleanModel, ObjectsModel, colors
 
+from utilities import softmax, flatten, are_equivalent, remove_duplicates, check_c
+
 symmetric_ops = [
     'land_', 'lor_'
 ]
+
+
+def produce_possible_structures(phonform, grammar):
+    """
+    Return a list of the ways of putting exactly one EXH
+    in the sentence.
+    
+    Arguments
+    ---------
+    phonform: LOTlib3.FunctionNode.FunctionNode
+        a phonological form 
+        i.e., parse without the silent morpheme EXH
+    grammar: LOTlib3 grammar
+        for global call, the grammar for the phonological form 
+        (with or without EXH)
+    Return
+    ------
+    list[LOTlib3.FunctionNode.FunctionNode]
+        A list of possible parses
+        i.e. ways of inserting EXH
+    """
+
+    # if it does not contain EXH yet, add it
+    try:
+        grammar.get_rule_by_name('EXH')
+    except AssertionError:
+        grammar = deepcopy(grammar)
+        # add EXH
+        grammar.add_rule('BOOL', 'EXH', ['BOOL'], 2.0)
+
+    # create a different copy of the full sentence
+    # for each subnode, and then add EXH to 
+    # nodes of type BOOL
+    subnodes = phonform.subnodes()
+    copies = [
+        copy(phonform)
+        for _ in range(len(subnodes))
+    ]
+
+    possibilities = []
+    for i, (original_subn, formcopy) in enumerate(zip(subnodes, copies)):
+        # if this is of type BOOL, we can add EXH
+        if original_subn.type() == 'BOOL':
+            # put EXH between node and supernode
+            subnode = formcopy.subnodes()[i]
+            supernode = subnode.parent
+            EXH_node = (
+                grammar
+                .get_rule_by_name('EXH')
+                .make_FunctionNodeStub(grammar, None)
+            )
+            EXH_node.args = [subnode]
+            subnode.parent = EXH_node
+            EXH_node.parent = supernode
+            try:
+                newargs = []
+                for arg in supernode.args:
+                    if arg is subnode:
+                        newargs.append(EXH_node)
+                    else:
+                        newargs.append(arg)
+                supernode.args = newargs
+            except AttributeError:
+                pass
+            possibilities.append(copies[i])
+    
+    return possibilities
+
+
+def find_phonform_possible_structures(phonform, grammar, qud, model, solver,
+                                      unique=True):
+    """
+    Grammar is the parse grammar
+
+    Generate the possible parse by placing a single EXH
+    everywhere it can be placed.
+    Parses are instances of the Parse class
+    """
+
+    parses_values = produce_possible_structures(
+        phonform, 
+        grammar
+    )
+
+    possible_parses = [
+        Parse(
+            qud=qud, 
+            model=model,
+            grammar=grammar,
+            solver=solver,
+            value=value,
+        )
+        for value in parses_values
+    ]
+
+    possible_meanings = [
+        x() 
+        for x in possible_parses
+    ]
+
+    ### HURFORD CONSTRAINT ###
+    results = []
+    for m, uv in zip(possible_meanings, parses_values):
+        if hurford_constraint(m, solver):
+            results.append((m, uv))
+        else:
+            print(f"{uv} has been excluded because failed hurford!")
+    possible_meanings, parses_values = zip(*results)
+
+    if unique:
+        indices_unique, possible_meanings = remove_duplicates(
+            possible_meanings,
+            solver,
+            return_indices=True
+        )
+        parses_values = [parses_values[i] for i in indices_unique]
+
+    return possible_meanings, parses_values
     
 
-def define_grammar(n_props, EXH=False, index=None):
+def define_grammar(n_props, gtype, EXH=False):
     """
     This function can be used to define the grammar that defines
     the meanings and the grammar that defines the parses.
@@ -35,40 +156,26 @@ def define_grammar(n_props, EXH=False, index=None):
     ---------
     n_props: int
         Number of propositions to consider
+    gtype: str
+        'utterance' or 'belief'
     EXH: bool
         Whether to include EXH in the grammar
-    index: None | int
-        When this is an int:
-            - The grammar defines the speaker's belief along with the index of the true parse.
-            - Hypotheses take the form (int, bool). 
-            - The value of the int argument encodes the number of possible parses
-              (among the ones compatible with the phonological form).
-              This depends on the phonological form!
-            - The first element of the tuple encodes the index of the true parse.
-            - The second element encodes the speaker's belief.
-        When None:
-            - Hypotheses take the form bool.
-        
+    
     """
     
     grammar = Grammar()
 
+    grammar.add_rule('START', '', ['BOOL'], 1.0)
+    
     # This effectively functions as a check for whether we are using the grammar 
     # to define beliefs or parses.
-    if type(index) == int:
+    if gtype == "belief":
         # We are encoding beliefs!
-        grammar.add_rule('START', 'tuple_', ['PARSEINDEX', 'BOOL'], 1.0)
-        for i in range(index):
-            grammar.add_rule('PARSEINDEX', f'u{i}', None, 1.0)
-            builtins.__dict__[f'u{i}'] = i
         # We need notp because when encoding beliefs, we don't want
         # knowledge of false propositions to be less likely
         grammar.add_rule('BOOL', 'notp', ['INDEX', 'MODEL'], 5.0)
-    else:
-        # We are encoding parses!
-        # NOTE: Keep this as empty string name, because that's how 
-        # it's recognized in the _exhaustify function
-        grammar.add_rule('START', '', ['BOOL'], 1.0)
+    elif gtype == 'utterance':
+        pass
     
     grammar.add_rule('BOOL', 'land', ['BOOL', 'BOOL'], 1.0)
     grammar.add_rule('BOOL', 'lor', ['BOOL', 'BOOL'], 1.0)
@@ -373,16 +480,15 @@ class Exhaustifier:
 
 class MeaningHypothesis(LOTHypothesis):
 
-    def __init__(self, parses, qud, solver, temp, model,
-                 grammar, print_log=False, **kwargs):
+    def __init__(self, utterance, qud, solver, temp, model,
+                 grammar, grammar_EXH, print_log=False, **kwargs):
         """
         A MeaningHypothesis encodes underlying meanings as structured objects, a la pLoT.
 
         Parameters
         ----------
-        parses:
-            All the possible meanings of the phonological form.
-            These are the "possible parses" in the RSA sense.
+        utterance:
+            The utterance as a Parse object.
         qud: QUD
             The question under discussion
         solver: z3 solver
@@ -393,8 +499,6 @@ class MeaningHypothesis(LOTHypothesis):
             The model M's interpretation
         grammar: lotlib3 grammar
             Without EXH: this encodes a belief state (rather than a parse)!
-            With index: this tracks the index of the parse 
-                        among the ones compatible with the phonform!
         """
 
         LOTHypothesis.__init__(
@@ -404,39 +508,39 @@ class MeaningHypothesis(LOTHypothesis):
             **kwargs
         )
 
-        self.parses = parses
+        self.utterance = utterance
+        self.exhaustifier = Exhaustifier(grammar_EXH, qud, solver)
         self.print_log = print_log
         self.solver = solver
         self.qud = qud
         self.temp = temp
         self.model = model
+    
+        self.grammar_EXH = grammar_EXH
+    
 
-        self.define_p_given_parse()
-
-    def define_p_given_parse(self):
+    def define_p_given_parse(self, parses):
         """
         Find the distribution over the answers to the QUD 
         for an L0, given each possible parse.
         Shape: (parse, QUD answer)
         """
         p_given_parses = []
-        n_compatible_parses = 0
-        for u in self.parses:
+        for u in parses:
             p_given_parse = []
             for prop in self.qud:
                 self.solver.push()
                 self.solver.add(z3.And(u, prop))
                 compatible = self.solver.check() == z3.sat
                 p_given_parse.append(compatible)
-                n_compatible_parses += compatible
                 self.solver.pop()
 
             p_given_parses.append([
                 x/sum(p_given_parse) 
                 for x in p_given_parse
             ])
-        self.p_given_parses = p_given_parses
-        self.n_compatible_parses = n_compatible_parses
+
+        return p_given_parses
 
 
     def compute_single_likelihood(self, datum):
@@ -452,114 +556,162 @@ class MeaningHypothesis(LOTHypothesis):
         by marginalizing across the possible meanings of the phon form.
         """
 
-        # get listener's hypothesis about the speaker's state as a z3 formula,
-        # which consists of the index of the true parse 
-        # (according to the hypothesis)
-        # and the belief state of the speaker.
-        i, f = self(self.model)
+        # the utterance (phonological form)
+        utterance = self.utterance
+        
+        # get listener's hypothesis about the speaker's belief as a z3 formula
+        f = self(self.model)
+        # print('f: ', f)
 
-        # Get just the parse indicated by the meaning
-        # The parse is a Parse object
-        # u = self.parses[i]
+        # loop over the alternative utterances that the speaker
+        # could have produced (Gricean step)
+        # considering structural alternatives
+        unnorm_probs_for_alternatives = []
+        actual_index = None
+        alts = list(self.exhaustifier.find_structural_alternatives(utterance))
+        for i_alt, alt in enumerate(alts):
 
-        unnorm_parse_prob = []
-        for u in self.parses:
+            if alt == utterance:
+                actual_index = i_alt
+            # get the parses predicted by Exh
+            # and their respective meanings
             
-            # we assume that the speaker does not say more than they believe to be true!
-            # (e.g., if the speaker believes 'p', they might say 'p or q', which is also true in q,
-            # but if the speaker believes 'p or q', they're not going to say 'p')
-            # So we check that belief state is at least as strong as the parse.
-            # Check that the belief state entails the parse.
-            # (i.e., negation is unsatisfiable)
-            self.solver.push()
-            self.solver.add(z3.Not(z3.Implies(f, u)))
-            implies = self.solver.check() == z3.unsat
-            self.solver.pop()
-    
-            # We also assume the belief is consistent, so check *that*
-            self.solver.push()
-            self.solver.add(f)
-            consistent = self.solver.check() == z3.sat
-            self.solver.pop()
-    
-            if consistent and implies:
-    
-                # Belief is consistent and entails parse, so
-                # it's a possible candidate!
-                # Find probability of parse u given belief state f
-    
-                # p_answer_given_belief says for each possible answers to the QUD
-                # whether the answer is compatible with the belief state
-                p_answer_given_belief = []
-                n_compatible_belief = 0
-                for j, prop in enumerate(self.qud):
-                    if self.p_given_parses[i][j] == 1:
-                        # since the belief implies the parse,
-                        # if an answer is compatible with the belief,
-                        # it will also be compatible with the parse
-                        p_answer_given_belief.append(1)
+            possible_meanings, parses = find_phonform_possible_structures(
+                phonform=alt,                                                   
+                grammar=self.grammar_EXH,                                                 
+                qud=self.qud,                                                             
+                model=self.model,                                                         
+                solver=self.solver,                                                       
+                unique=True                                                          
+            )
+
+            # get the probability of each QUD partition element
+            # given each possible parse
+            p_given_parses = self.define_p_given_parse(possible_meanings)
+
+            # loop over the meanings of the parses for that utterance 
+            # (alternative or actual)
+            unnorm_parse_prob = []
+            for i, u in enumerate(possible_meanings):
+                
+                # we assume that the speaker does not say more than they believe to be true!
+                # (e.g., if the speaker believes 'p', they might say 'p or q', which is also true in q,
+                # but if the speaker believes 'p or q', they're not going to say 'p')
+                # So we check that belief state is at least as strong as the parse.
+                # Check that the belief state entails the parse.
+                # (i.e., negation is unsatisfiable)
+                self.solver.push()
+                self.solver.add(z3.Not(z3.Implies(f, u)))
+                implies = self.solver.check() == z3.unsat
+                self.solver.pop()
+        
+                # We also assume the belief is consistent, so check *that*
+                self.solver.push()
+                self.solver.add(f)
+                consistent = self.solver.check() == z3.sat
+                self.solver.pop()
+        
+                if consistent and implies:
+        
+                    # Belief is consistent and entails parse, so
+                    # it's a possible candidate!
+                    # Find probability of parse u given belief state f
+        
+                    # p_answer_given_belief says for each possible answers to the QUD
+                    # whether the answer is compatible with the belief state
+                    p_answer_given_belief = []
+                    n_compatible_belief = 0
+                    for j, prop in enumerate(self.qud):
+                        # Remove for now - this was just to make
+                        # the calculation quicker
                         
-                    else:
-                        self.solver.push()
-                        self.solver.add(z3.And(f, prop))
-                        compatible = self.solver.check() == z3.sat
-                        p_answer_given_belief.append(compatible)
-                        self.solver.pop()
-                        n_compatible_belief += compatible
-    
-                ##### calculation of the utility as KL(belief || parse)
-    
-                # Normalize to get the (approximate) probability of each answer
-                # to the QUD given the belief state.
-                # Since each element of p_answer_given_belief is a boolean, all probs
-                # are going to be either 0 or 1/sum(p_answer_given_belief).
-                p_answer_given_belief = [
-                    x/sum(p_answer_given_belief) 
-                    for x in p_answer_given_belief
-                ]
-    
-                # compute the (negative) KL(belief || parse)
-                # This is a measure of how much information the 
-                # parse gives about the information in the speaker's belief 
-                # that's relevant to answering the QUD
-                util = -sum([
-                    x*(np.log(x) - np.log(y)) 
-                    if (x != 0 and y != 0) else 0
-                    for x,y in zip(p_answer_given_belief, self.p_given_parses[i])
-                ])
-    
-            else:
-                util = -Infinity
-    
-            # We don't need to consider the cost 
-            # because we are only finding out which parse
-            # the speaker intended, but they all have
-            # the same utterance cost.
-            prob = np.exp(np.array(util) * self.temp)
-            unnorm_parse_prob.append(prob)
-    
-            if self.print_log:
-                print()
-                print('----------')
-                print('hyp: ', self.__str__())
-                print('qud: ', self.qud)
-                print('util:', util)
-                print('exp KL: ', prob)
-            
-            if np.isnan(prob) or prob==0:
+                        # if self.p_given_parses[i][j] == 1:
+                        #     # since the belief implies the parse,
+                        #     # if an answer is compatible with the belief,
+                        #     # it will also be compatible with the parse
+                        #     p_answer_given_belief.append(1)
+                            
+                        # else:
+                            self.solver.push()
+                            self.solver.add(z3.And(f, prop))
+                            compatible = self.solver.check() == z3.sat
+                            p_answer_given_belief.append(compatible)
+                            self.solver.pop()
+                            n_compatible_belief += compatible
+        
+                    ##### calculation of the utility as KL(belief || parse)
+        
+                    # Normalize to get the (approximate) probability of each answer
+                    # to the QUD given the belief state.
+                    # Since each element of p_answer_given_belief is a boolean, all probs
+                    # are going to be either 0 or 1/sum(p_answer_given_belief).
+                    p_answer_given_belief = [
+                        x/sum(p_answer_given_belief) 
+                        for x in p_answer_given_belief
+                    ]
+        
+                    # compute the (negative) KL(belief || parse)
+                    # This is a measure of how much information the 
+                    # parse gives about the information in the speaker's belief 
+                    # that's relevant to answering the QUD
+                    util = -sum([
+                        x*(np.log(x) - np.log(y)) 
+                        if (x != 0 and y != 0) else 0
+                        for x,y in zip(p_answer_given_belief, p_given_parses[i])
+                    ])
+        
+                else:
+                    util = -Infinity
+        
+                # We don't need to consider the cost 
+                # because we are only finding out which parse
+                # the speaker intended, but they all have
+                # the same utterance cost.
+                prob = np.exp(np.array(util) * self.temp)
+                unnorm_parse_prob.append(prob)
+        
                 if self.print_log:
-                    print('inconsistent prob: ', prob)
                     print()
-                # if the speaker said something incoherent
-                return log(1-datum.alpha)
-    
-            if self.print_log:
-                print('prob belief: ', prob_belief)
-                print('total lik: ', prob*prob_belief)
+                    print('----------')
+                    print('hyp: ', self.__str__())
+                    print('qud: ', self.qud)
+                    print('util:', util)
+                    print('exp KL: ', prob)
+                
+                # if np.isnan(prob) or prob==0:
+                #     if self.print_log:
+                #         print('inconsistent prob: ', prob)
+                #         print()
+                #     # if the speaker said something incoherent
+                #     return log(1-datum.alpha)
+        
+                if self.print_log:
+                    print('prob belief: ', prob_belief)
+                    print('total lik: ', prob*prob_belief)
 
-        prob = np.array(unnorm_parse_prob)/np.sum(unnorm_parse_prob)
-        prob_belief = self.qud.QUD_prior(f)
-        return log(prob) + log(prob_belief)
+            # this contains the unnormalized probability that the speaker
+            # would choose each parse of the currently considered
+            # alternative utterance
+            unnorm_probs_for_alternatives.append(unnorm_parse_prob)
+            
+
+        # print('alts: ', alts)
+        # print('\nprobs_for_alts:', unnorm_probs_for_alternatives,"\n")
+
+        # TODO: normalize across all alternatives and parses
+        unnorm_probs_for_alternatives = np.array(unnorm_probs_for_alternatives)
+        probs_for_alternatives = unnorm_probs_for_alternatives / np.sum(unnorm_probs_for_alternatives)
+        prob_utterance = np.mean(probs_for_alternatives, axis=1)[actual_index]
+
+        print(f, prob_utterance)
+
+        # TODO: Get the probability of the actually observed one
+        # (which is the 0th one)
+        
+        # prob = np.array(unnorm_parse_prob)/np.sum(unnorm_parse_prob)
+        # prob_belief = self.qud.QUD_prior(f)
+        # return log(prob) + log(prob_belief)
+        return np.log(prob_utterance)
 
     def __copy__(self, value=None):
         """
@@ -568,12 +720,13 @@ class MeaningHypothesis(LOTHypothesis):
         """
 
         thecopy = type(self)(
-            parses=self.parses,
+            utterance=self.utterance,
             qud=self.qud,
             solver=self.solver,
             temp=self.temp,
             model=self.model,
             grammar=self.grammar,
+            grammar_EXH=self.grammar_EXH
         ) 
 
         # copy over all the relevant attributes and things.

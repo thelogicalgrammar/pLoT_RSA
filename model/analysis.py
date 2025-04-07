@@ -1,7 +1,5 @@
-from model.utilities import (
-    find_phonform_possible_structures,
-    print_possible_parses
-)
+from model.utilities import print_possible_parses
+from model.grammar import find_phonform_possible_structures
 
 from model.grammar import MeaningHypothesis
 
@@ -17,20 +15,19 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def already_defined(dictionary, fullmeaning, posterior_score, solver):
+def already_defined(dictionary, meaning, posterior_score, solver):
     """
     Find marginal distribution of meanings in the posterior
     """
     assert posterior_score >= 0, 'Posterior score in prob space, not logprob!'
     dictionary = deepcopy(dictionary)
     new = True
-    parse_index, meaning = fullmeaning
-    for (i, m), p in dictionary.items():
+    for m, p in dictionary.items():
         solver.push()
         solver.add(z3.Not(meaning == m))
-        if (solver.check() == z3.unsat) and (i == parse_index):
+        if solver.check() == z3.unsat:
             # equivalent
-            dictionary[(parse_index, m)] = p + posterior_score
+            dictionary[m] = p + posterior_score
             # it's not going to be synonymous
             # with anything else, given how
             # dictionary is constructed
@@ -39,7 +36,7 @@ def already_defined(dictionary, fullmeaning, posterior_score, solver):
             break
         solver.pop()
     if new:
-        dictionary[fullmeaning] = posterior_score
+        dictionary[meaning] = posterior_score
 
     return dictionary
 
@@ -51,11 +48,11 @@ def compress_meaning_dict(dictionary):
     """
     returnvalue = dict()
     # get unique meanings
-    set_of_meanings = set(m for (i, m), p in dictionary.items())
+    set_of_meanings = set(m for m, p in dictionary.items())
     for m in set_of_meanings:
         # get the sum of all probabilities of m
         sum_ps = 0
-        for (i, m2), p in dictionary.items():
+        for m2, p in dictionary.items():
             if m2 == m:
                 sum_ps += p
         returnvalue[m] = sum_ps
