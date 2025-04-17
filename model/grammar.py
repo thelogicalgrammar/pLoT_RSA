@@ -460,104 +460,99 @@ class MeaningHypothesis(LOTHypothesis):
 
         # Get just the parse indicated by the meaning
         # The parse is a Parse object
-        # u = self.parses[i]
+        u = self.parses[i]
+        
+        # we assume that the speaker does not say more than they believe to be true!
+        # (e.g., if the speaker believes 'p', they might say 'p or q', which is also true in q,
+        # but if the speaker believes 'p or q', they're not going to say 'p')
+        # So we check that belief state is at least as strong as the parse.
+        # Check that the belief state entails the parse.
+        # (i.e., negation is unsatisfiable)
+        self.solver.push()
+        self.solver.add(z3.Not(z3.Implies(f, u)))
+        implies = self.solver.check() == z3.unsat
+        self.solver.pop()
 
-        unnorm_parse_prob = []
-        for u in self.parses:
-            
-            # we assume that the speaker does not say more than they believe to be true!
-            # (e.g., if the speaker believes 'p', they might say 'p or q', which is also true in q,
-            # but if the speaker believes 'p or q', they're not going to say 'p')
-            # So we check that belief state is at least as strong as the parse.
-            # Check that the belief state entails the parse.
-            # (i.e., negation is unsatisfiable)
-            self.solver.push()
-            self.solver.add(z3.Not(z3.Implies(f, u)))
-            implies = self.solver.check() == z3.unsat
-            self.solver.pop()
-    
-            # We also assume the belief is consistent, so check *that*
-            self.solver.push()
-            self.solver.add(f)
-            consistent = self.solver.check() == z3.sat
-            self.solver.pop()
-    
-            if consistent and implies:
-    
-                # Belief is consistent and entails parse, so
-                # it's a possible candidate!
-                # Find probability of parse u given belief state f
-    
-                # p_answer_given_belief says for each possible answers to the QUD
-                # whether the answer is compatible with the belief state
-                p_answer_given_belief = []
-                n_compatible_belief = 0
-                for j, prop in enumerate(self.qud):
-                    if self.p_given_parses[i][j] == 1:
-                        # since the belief implies the parse,
-                        # if an answer is compatible with the belief,
-                        # it will also be compatible with the parse
-                        p_answer_given_belief.append(1)
-                        
-                    else:
-                        self.solver.push()
-                        self.solver.add(z3.And(f, prop))
-                        compatible = self.solver.check() == z3.sat
-                        p_answer_given_belief.append(compatible)
-                        self.solver.pop()
-                        n_compatible_belief += compatible
-    
-                ##### calculation of the utility as KL(belief || parse)
-    
-                # Normalize to get the (approximate) probability of each answer
-                # to the QUD given the belief state.
-                # Since each element of p_answer_given_belief is a boolean, all probs
-                # are going to be either 0 or 1/sum(p_answer_given_belief).
-                p_answer_given_belief = [
-                    x/sum(p_answer_given_belief) 
-                    for x in p_answer_given_belief
-                ]
-    
-                # compute the (negative) KL(belief || parse)
-                # This is a measure of how much information the 
-                # parse gives about the information in the speaker's belief 
-                # that's relevant to answering the QUD
-                util = -sum([
-                    x*(np.log(x) - np.log(y)) 
-                    if (x != 0 and y != 0) else 0
-                    for x,y in zip(p_answer_given_belief, self.p_given_parses[i])
-                ])
-    
-            else:
-                util = -Infinity
-    
-            # We don't need to consider the cost 
-            # because we are only finding out which parse
-            # the speaker intended, but they all have
-            # the same utterance cost.
-            prob = np.exp(np.array(util) * self.temp)
-            unnorm_parse_prob.append(prob)
-    
+        # We also assume the belief is consistent, so check *that*
+        self.solver.push()
+        self.solver.add(f)
+        consistent = self.solver.check() == z3.sat
+        self.solver.pop()
+
+        if consistent and implies:
+
+            # Belief is consistent and entails parse, so
+            # it's a possible candidate!
+            # Find probability of parse u given belief state f
+
+            # p_answer_given_belief says for each possible answers to the QUD
+            # whether the answer is compatible with the belief state
+            p_answer_given_belief = []
+            n_compatible_belief = 0
+            for j, prop in enumerate(self.qud):
+                if self.p_given_parses[i][j] == 1:
+                    # since the belief implies the parse,
+                    # if an answer is compatible with the belief,
+                    # it will also be compatible with the parse
+                    p_answer_given_belief.append(1)
+                    
+                else:
+                    self.solver.push()
+                    self.solver.add(z3.And(f, prop))
+                    compatible = self.solver.check() == z3.sat
+                    p_answer_given_belief.append(compatible)
+                    self.solver.pop()
+                    n_compatible_belief += compatible
+
+            ##### calculation of the utility as KL(belief || parse)
+
+            # Normalize to get the (approximate) probability of each answer
+            # to the QUD given the belief state.
+            # Since each element of p_answer_given_belief is a boolean, all probs
+            # are going to be either 0 or 1/sum(p_answer_given_belief).
+            p_answer_given_belief = [
+                x/sum(p_answer_given_belief) 
+                for x in p_answer_given_belief
+            ]
+
+            # compute the (negative) KL(belief || parse)
+            # This is a measure of how much information the 
+            # parse gives about the information in the speaker's belief 
+            # that's relevant to answering the QUD
+            util = -sum([
+                x*(np.log(x) - np.log(y)) 
+                if (x != 0 and y != 0) else 0
+                for x,y in zip(p_answer_given_belief, self.p_given_parses[i])
+            ])
+
+        else:
+            util = -Infinity
+
+        # We don't need to consider the cost 
+        # because we are only finding out which parse
+        # the speaker intended, but they all have
+        # the same utterance cost.
+        prob = np.exp(np.array(util) * self.temp)
+
+        if self.print_log:
+            print()
+            print('----------')
+            print('hyp: ', self.__str__())
+            print('qud: ', self.qud)
+            print('util:', util)
+            print('exp KL: ', prob)
+        
+        if np.isnan(prob) or prob==0:
             if self.print_log:
+                print('inconsistent prob: ', prob)
                 print()
-                print('----------')
-                print('hyp: ', self.__str__())
-                print('qud: ', self.qud)
-                print('util:', util)
-                print('exp KL: ', prob)
-            
-            if np.isnan(prob) or prob==0:
-                if self.print_log:
-                    print('inconsistent prob: ', prob)
-                    print()
-                # if the speaker said something incoherent
-                return log(1-datum.alpha)
-    
-            if self.print_log:
-                print('prob belief: ', prob_belief)
-                print('total lik: ', prob*prob_belief)
+            # if the speaker said something incoherent
+            return log(1-datum.alpha)
 
-        prob = np.array(unnorm_parse_prob)/np.sum(unnorm_parse_prob)
+        if self.print_log:
+            print('prob belief: ', prob_belief)
+            print('total lik: ', prob*prob_belief)
+
         prob_belief = self.qud.QUD_prior(f)
         return log(prob) + log(prob_belief)
 
